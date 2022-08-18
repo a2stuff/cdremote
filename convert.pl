@@ -37,6 +37,7 @@ OpenApple           := $C061
 
 CardROMByte         := $C5FF
 
+COUT                := $FDED
 EOD
 
 

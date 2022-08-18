@@ -5,7 +5,7 @@ ZP2                 := $1B
 ZP3                 := $1D
 PlayedListPtr       := $1F
 
-
+COUT                := $FDED
 MLIEntry            := $BF00
 
 Kbd                 := $C000
@@ -33,25 +33,25 @@ MAIN:               lda ZP1
                     lda ZP3 + 1
                     pha
 
-                    ; "Null" T/M/S values
+                    ; "Null" out T/M/S values
                     lda #$aa
                     sta BCDRelTrack
                     sta BCDRelMinutes
                     sta BCDRelSeconds
 
-                    ; Locate an Apple SCSI card and CDSC drive
+                    ; Locate an Apple SCSI card and CDSC/CDSC+ drive
                     jsr FindHardware
                     bcs EXIT
 
-                    ; Setup
+                    ; Application setup
                     jsr InitializeScreen
                     jsr InitDriveAndDisc
-                    jsr CPLInitPlayedList
+                    jsr InitPlayedList
 
-                    ; Do everything!
+                    ; Do all the things!
                     jsr MainLoop
 
-                    ; Restore the ZP values and call MLI QUIT
+                    ; Restore the saved ZP values and call MLI QUIT
 EXIT:               pla
                     sta ZP1
                     pla
@@ -85,27 +85,27 @@ InitDriveAndDisc:   jsr StatusDrive
                     jsr C24AudioStatus
                     lda SPBuffer
                     ; Audio Status = $00 (currently playing)
-                    beq IDADPlaying
+                    beq IDDPlaying
                     dec a
                     ; Audio status = $01 (currently paused)
-                    beq IDADPaused
+                    beq IDDPaused
                     ; Audio status = anything else - stop operation explicitly
                     jsr DoStopAction
                     bra ExitInitDriveDisc
 
                     ; Set Pause button to active
-IDADPaused:         dec PauseButtonState
-                    jsr BLiTPauseButton
+IDDPaused:          dec PauseButtonState
+                    jsr ToggleUIPauseButton
                     ; Read the current disc position and update the Track and Time display
                     jsr C28ReadQSubcode
                     jsr DrawTrack
                     jsr DrawTime
 
                     ; Set Play button to active
-IDADPlaying:        dec PlayButtonState
+IDDPlaying:         dec PlayButtonState
                     ; Set drive playing flag to true
                     dec DrivePlayingFlag
-                    jsr BLiTPlayButton
+                    jsr ToggleUIPlayButton
                     bra ExitInitDriveDisc
 ExitInitDriveDisc:  rts
 
@@ -115,7 +115,7 @@ InitializeScreen:   lda SetFullScreen
                     lda SetHiRes
                     lda SetPage1
 
-                    ; Clear to white, initialize the GUI elements
+                    ; Clear screen to all white, initialize the GUI elements
                     jsr ClearHGR1toWhite
                     jsr PaintCDRemoteUI
                     jsr PaintCDRemoteMenu
@@ -123,37 +123,41 @@ InitializeScreen:   lda SetFullScreen
                     jsr DrawTime
                     rts
 
+                    ; This is the start of where all the real action takes place
 MainLoop:           lda TOCInvalidFlag
+                    ; Have we read in a valid, usable TOC from an audio CD?
                     beq TOCisValid
 
-                    ; We don't have a valid TOC - poll the drive to see if it's online so we can read the TOC
+                    ; We don't have a valid TOC - poll the drive to see if it's online so we can try to read a TOC
                     jsr StatusDrive
-                    ; Nope - drive is offline, go watch for user input
+                    ; No - drive is offline, go check for user input instead
                     bcs NoFurtherBGAction
-                    ; Yep - make another attempt at reading the TOC
+                    ; Yes - make another attempt at reading a TOC
                     jsr ReReadTOC
 
-                    ; Re-status the drive
+                    ; Re-check the status of the drive
 TOCisValid:         jsr StatusDrive
                     lda DrivePlayingFlag
-                    ; Drive is not currently playing, go watch for user input
+                    ; Drive is not currently playing audio, go check for user input
                     beq NoFurtherBGAction
 
-                    ; Drive is playing, check for a Status of $03 = "Play operation complete"
+                    ; Drive is playing audio, watch for an AudioStatus return code of $03 = "Play operation complete"
                     jsr C24AudioStatus
                     lda SPBuffer
                     cmp #$03
-                    ; Playing is not done - go read the QSubcode and update the Track & Time display
+                    ; Audio playback operation is not complete
                     bne StillPlaying
 
                     ; Deal with reaching the end of a playback operation.  It's complicated.  :)
                     jsr PlayBackComplete
 
+                    ; Go read the QSubcode channel and update the Track & Time display
 StillPlaying:       jsr C28ReadQSubcode
                     bcs NoFurtherBGAction
                     jsr DrawTrack
                     jsr DrawTime
 
+                    ; Read and process any Keyboard inputs from the user
 NoFurtherBGAction:  jsr GetKeypress
                     bcs MainLoop
 
@@ -179,7 +183,7 @@ NotL:               cmp #$52
                     jsr ToggleRandomMode
                     jmp MainLoop
 
-                    ; All other key operations (Play/Stop/Pause/Next/Prev/Eject) require an online drive/disc
+                    ; All other key operations (Play/Stop/Pause/Next/Prev/Eject) require an online drive/disc, so check one more time
 NotR:               jsr StatusDrive
                     bcs MainLoop
 
@@ -240,7 +244,7 @@ UnsupportedKeypress:jmp MainLoop
 DoQuitAction:       rts
 
 PlayBackComplete:   lda RandomButtonState
-                    ; Random button is inactive - implies entire Disc has ended
+                    ; Random button is inactive - the entire Disc has been played to the end
                     beq PBCRandomIsInactive
 
                     ; Random button is active - handle rollover to next random track
@@ -255,14 +259,15 @@ PlayBackComplete:   lda RandomButtonState
                     ; Haven't played all the tracks on the disc, so pick another one
                     bne PBCPlayARandomTrack
 
-                    ; All tracks have been played - Clear the Play button to inactive and call... some Random-related Function?
+                    ; All tracks have been played randomly - clear the Play button STATE to inactive (with no UI change) ...
                     lda #$00
                     sta PlayButtonState
+                    ; re-randomize from scratch ...
                     jsr RandomModeInit
-
-                    ; then reset Play button back to active
+                    ; then reset the Play button STATE back to active (again with no UI change)
                     lda #$ff
                     sta PlayButtonState
+
                     lda LoopButtonState
                     ; Loop button is active, so play the whole disc over again - start by picking a new track
                     bne PBCPlayARandomTrack
@@ -279,13 +284,14 @@ PlayBackComplete:   lda RandomButtonState
 PBCPlayARandomTrack:jsr PickARandomTrack
                     lda BCDRandomPickedTrk
 
-                    ; We're "playing" just one track now, so Current, First, and Last are all the same
+                    ; We're in random mode, "playing" just one track now, so Current/First/Last are all the same
                     sta BCDRelTrack
                     sta BCDFirstTrackNow
                     sta BCDLastTrackNow
+                    ; and we're "stopping" at the end of the current track
                     jsr SetStopToEoBCDLTN
 
-                    ; Set flag to Track mode, because random mode
+                    ; Set flag to Track mode, because we're in random mode
                     lda #$ff
                     sta TrackOrMSFFlag
 
@@ -293,22 +299,23 @@ PBCPlayARandomTrack:jsr PickARandomTrack
                     jsr C21AudioPlay
                     bra ExitPBCHandler
 
-                    ; Disc is ended, do we need to loop?
+                    ; Entire disc has been played to the end, do we need to loop?
 PBCRandomIsInactive:lda LoopButtonState
-                    ; Loop Button is inactive - so we stop
+                    ; Loop Button is inactive - so we just stop
                     beq PBCLoopIsInactive
 
-                    ; Loop button is active - Explicitly stop playback and set stop point to EoT LastTrack
+                    ; Loop button is active - reset stop point to EoT LastTrack
                     jsr C23AudioStop
                     lda PlayButtonState
                     ; Play button is inactive - bail out, there's nothing to do
                     beq ExitPBCHandler
 
-                    ; Make sure we start from the first track on the disc
+                    ; Make sure we start fresh from the first track on the disc
                     lda BCDFirstTrackTOC
                     sta BCDFirstTrackNow
+                    ; Set flag to MSF mode, because we're not in random mode
                     dec TrackOrMSFFlag
-                    ; and play
+                    ; Call AudioPlay function and exit
                     jsr C21AudioPlay
                     bra ExitPBCHandler
 
@@ -323,7 +330,7 @@ PBCLoopIsInactive:  lda PlayButtonState
 ExitPBCHandler:     rts
 
 StatusDrive:        pha
-                    ; Try three times
+                    ; Try three times for a good status return
                     lda #$03
                     sta RetryCount
 
@@ -338,7 +345,7 @@ RetryLoop:          lda #$00
                     dec RetryCount
                     bne RetryLoop
                     sec
-                    ; Failed Status call three times
+                    ; Failed Status call three times - exit with carry set
                     bra ExitStatusDrive
 
                     ; First byte is general status byte
@@ -348,21 +355,25 @@ GotStatus:          lda SPBuffer
                     beq StatusDriveSuccess
 
                     lda TOCInvalidFlag
-                    ; TOC is flagged invalid - just return the Status call failure
+                    ; TOC is currently flagged invalid - that's expected, so just return the Status call failure
                     bne StatusDriveFail
 
-                    ; EXCEPTION - Call a HardShutdown if we encounter a bad Status call with a valid TOC
+                    ; EXCEPTION - Call a HardShutdown if we encounter a bad Status call with an existing valid TOC because something's gone very wrong
                     jsr HardShutdown
-                    ; and hard flag the TOC as now invalid
+                    ; Hard-flag the TOC as now invalid
                     lda #$ff
                     sta TOCInvalidFlag
+
+                    ; Exit with carry set
 StatusDriveFail:    sec
                     bra ExitStatusDrive
+
+                    ; Exit with carry clear
 StatusDriveSuccess: clc
 ExitStatusDrive:    pla
                     rts
 
-                    ; EXCEPTION - Explicitly stop the CD drive, forcibly clear the Play/Pause buttons, forcibly set the Stop button, and wipe the Track/Time display
+                    ; EXCEPTION - Explicitly stop the CD drive, forcibly clear the Play/Pause buttons, forcibly set the Stop button, and wipe the Track/Time display clean
 HardShutdown:       jsr DoStopAction
                     lda PauseButtonState
                     ; Pause button is inactive (already) - nothing to do
@@ -371,7 +382,7 @@ HardShutdown:       jsr DoStopAction
                     ; Clear Pause button to inactive
                     lda #$00
                     sta PauseButtonState
-                    jsr BLiTPauseButton
+                    jsr ToggleUIPauseButton
 
 NoPauseButtonChange:lda PlayButtonState
                     ; Play button is inactive (already) - nothing to do
@@ -380,7 +391,7 @@ NoPauseButtonChange:lda PlayButtonState
                     ; Clear Play button to inactive
                     lda #$00
                     sta PlayButtonState
-                    jsr BLiTPlayButton
+                    jsr ToggleUIPlayButton
 
 NoPlayButtonChange: lda StopButtonState
                     ; Stop button is active (already) - nothing to do
@@ -389,9 +400,9 @@ NoPlayButtonChange: lda StopButtonState
                     ; Set Stop button to active
                     lda #$ff
                     sta StopButtonState
-                    jsr BLiTStopButton
+                    jsr ToggleUIStopButton
 
-                    ; Null out T/M/S and blank Track & Time display
+                    ; "Null" out T/M/S values and blank Track & Time display
 ClearTrackAndTime:  lda #$aa
                     sta BCDRelTrack
                     sta BCDRelMinutes
@@ -408,7 +419,7 @@ ClearTrackAndTime:  lda #$aa
 
                     rts
 
-                    ; Called in the background if the drive ever reports valid status with an invalid TOC.
+                    ; Called in the background if the drive reports a valid/online Status and we still have an invalid TOC.
 ReReadTOC:          lda #$00
                     sta TOCInvalidFlag
                     jsr C27ReadTOC
@@ -418,12 +429,13 @@ ReReadTOC:          lda #$00
                     lda BCDLastTrackTOC
                     sbc BCDFirstTrackTOC
                     adc #$01
+                    ; Calculate the number of tracks on the disc, minus 1, and stash it
                     sta BCDTrackCount0Base
                     cld
 
                     ; Explicitly stop playback and set stop point to EoT LastTrack
                     jsr C23AudioStop
-                    ; Set Stop Flag to Track mode
+                    ; Set flag to Track mode
                     lda #$ff
                     sta TrackOrMSFFlag
 
@@ -440,38 +452,41 @@ ReReadTOC:          lda #$00
                     jsr RandomModeInit
 ExitReReadTOC:      rts
 
+                    ; Read a keypress if there is one
 GetKeypress:        inc RandomSeed
                     lda Kbd
                     bpl GKNoKeyPressed
                     bit KbdStrobe
 
-                    ; Strip high bit
+                    ; Strip the high bit
                     and #$7f
                     cmp #$61
                     bmi GKNotLowerCase
                     cmp #$7a
                     bpl GKNotLowerCase
-                    ; Force upper-case
+                    ; Force it to upper-case
                     and #$5f
 
+                    ; Set carry flag to indicate keypress or not, and exit
 GKNotLowerCase:     clc
                     bra ExitGetKeypress
 GKNoKeyPressed:     sec
 ExitGetKeypress:    rts
 
+                    ; Function to wait until an existing keypress is released
 KeyReleaseWait:     lda KbdStrobe
                     bmi KeyReleaseWait
                     rts
 
 DoPlayAction:       lda PauseButtonState
-                    ; Pause button is inactive (already) - nothing to do yet
+                    ; Pause button is inactive - nothing to do yet
                     beq DPAPauseIsInactive
 
                     ; Pause button is active - forcibly clear it to inactive and then...
                     lda #$00
                     sta PauseButtonState
-                    jsr BLiTPauseButton
-                    ; Call C22AudioPause to release Pause (resume playing) and exit
+                    jsr ToggleUIPauseButton
+                    ; call AudioPause to release Pause (resume playing) and exit
                     jsr C22AudioPause
                     bra ExitPlayAction
 
@@ -489,25 +504,26 @@ DPAPauseIsInactive: lda PlayButtonState
                     jsr PickARandomTrack
                     lda BCDRandomPickedTrk
 
-                    ; We're "playing" just one track, so Current, First, and Last are all the same
+                    ; In random mode, we're "playing" just one track, so Current/First/Last are all the same
                     sta BCDRelTrack
                     sta BCDFirstTrackNow
                     sta BCDLastTrackNow
+                    ; and we "stop" playing at the end of that track
                     jsr SetStopToEoBCDLTN
                     jsr C20AudioSearch
 
                     ; Set Play button to active
 DPARandomIsInactive:dec PlayButtonState
-                    jsr BLiTPlayButton
+                    jsr ToggleUIPlayButton
 
                     lda StopButtonState
-                    ; Stop button is inactive (already) - start the playback and exit
+                    ; Stop button is inactive (already) - just start the playback and exit
                     beq DPAStopIsInactive
 
                     ; Set Stop button to inactive, then start the playback and exit
                     lda #$00
                     sta StopButtonState
-                    jsr BLiTStopButton
+                    jsr ToggleUIStopButton
 
 DPAStopIsInactive:  jsr C21AudioPlay
 ExitPlayAction:     rts
@@ -516,7 +532,7 @@ DoStopAction:       lda StopButtonState
                     ; Stop button is active (already) - bail out, there's nothing to do
                     bne ExitStopAction
 
-                    ; Reset F/L to TOC values
+                    ; Reset First/Last to TOC values
                     lda BCDFirstTrackTOC
                     sta BCDFirstTrackNow
                     lda BCDLastTrackTOC
@@ -529,7 +545,7 @@ DoStopAction:       lda StopButtonState
                     ; Clear Play button to inactive
                     lda #$00
                     sta PlayButtonState
-                    jsr BLiTPlayButton
+                    jsr ToggleUIPlayButton
 
 DSAPlayIsInactive:  lda PauseButtonState
                     ; Pause button is inactive (already) - nothing to do
@@ -538,21 +554,21 @@ DSAPlayIsInactive:  lda PauseButtonState
                     ; Clear Pause button to inactive
                     lda #$00
                     sta PauseButtonState
-                    jsr BLiTPauseButton
+                    jsr ToggleUIPauseButton
 
                     ; Set Stop button to active
 DSAPauseIsInactive: lda #$ff
                     sta StopButtonState
                     ; Switch Stop Flag to EoTrack mode
                     dec TrackOrMSFFlag
-                    jsr BLiTStopButton
+                    jsr ToggleUIStopButton
 
                     ; Force drive to seek to first track
                     lda BCDFirstTrackNow
                     sta BCDRelTrack
                     jsr C20AudioSearch
 
-                    ; Explicitly stop playback and set stop point to EoT LastTrack
+                    ; Explicitly stop playback and set stop point to EoT last Track
                     jsr C23AudioStop
 
                     ; Update Track and Time display
@@ -570,7 +586,7 @@ DoPauseAction:      lda StopButtonState
                     lda #$ff
                     eor PauseButtonState
                     sta PauseButtonState
-                    jsr BLiTPauseButton
+                    jsr ToggleUIPauseButton
 
                     ; Execute pause action (pause or resume) based on new button state
                     jsr C22AudioPause
@@ -582,7 +598,7 @@ ExitPauseAction:    rts
 ToggleLoopMode:     lda #$ff
                     eor LoopButtonState
                     sta LoopButtonState
-                    jsr BLiTLoopButton
+                    jsr ToggleUILoopButton
                     jsr KeyReleaseWait
                     rts
 
@@ -591,11 +607,11 @@ ToggleRandomMode:   lda #$ff
                     sta RandomButtonState
                     beq TRMRandomIsInactive
 
-                    ; Random button is now active - re-initialize that mode and exit
+                    ; Random button is now active - re-initialize random mode and exit
                     jsr RandomModeInit
                     bra TRMUpdateButton
 
-                    ; Random button is now inactive - reset first/last to TOC values and update stop point
+                    ; Random button is now inactive - reset First/Last to TOC values and update stop point to EoT last Track
 TRMRandomIsInactive:lda BCDLastTrackTOC
                     sta BCDLastTrackNow
                     lda BCDFirstTrackTOC
@@ -603,17 +619,17 @@ TRMRandomIsInactive:lda BCDLastTrackTOC
                     jsr SetStopToEoBCDLTN
 
                     ; Update UI, wait for key release, and exit
-TRMUpdateButton:    jsr BLiTRandomButton
+TRMUpdateButton:    jsr ToggleUIRandButton
                     jsr KeyReleaseWait
                     rts
 
-                    ; Zero the "played track count"
+                    ; Zero the Played Track Counter
 RandomModeInit:     lda #$00
                     sta HexPlayedCount0Base
                     ; Clear the list of what Tracks have been played
                     jsr ClearPlayedList
 
-                    ; Convert BCDTrackCountMinus1 into Hex and store it in HexTrackCountMinus1
+                    ; Convert the BCD count-of-tracks-minus-1 into a Hex count-of-tracks-minus-1 and store it in HexTrackCount0Base
                     lda BCDTrackCount0Base
                     and #$0f
                     sta HexTrackCount0Base
@@ -627,6 +643,7 @@ RandomModeInit:     lda #$00
                     adc RandFuncTempStorage
                     clc
                     adc HexTrackCount0Base
+                    ; This value is used to compare against HexPlayedCount0Base so we can determine when we've random-played the whole disc
                     sta HexTrackCount0Base
 
                     lda PlayButtonState
@@ -640,7 +657,7 @@ RandomModeInit:     lda #$00
                     sta BCDLastTrackNow
                     jsr SetStopToEoBCDLTN
 
-                    ; Mark the "Track"th element of the Played Track List as $FF
+                    ; Mark the current Track's element of the Played List as $FF ("played")
                     phy
                     ldy BCDRelTrack
                     lda #$ff
@@ -658,7 +675,7 @@ DoScanBackAction:   lda PlayButtonState
                     bne ExitScanBackAction
 
                     ; Highlight the Scan Back button and engage "scan" mode backwards
-                    jsr BLiTScanBackButton
+                    jsr ToggleUIScanBackButton
                     jsr C25AudioScanBack
 
                     ; Keep updating the time display as long as you get good QSub reads
@@ -671,8 +688,8 @@ DSBALoop:           jsr C28ReadQSubcode
 DSBAQSubReadErr:    lda KbdStrobe
                     bmi DSBALoop
 
-                    ; Dim the Scan Back button, and resume playing where we are
-                    jsr BLiTScanBackButton
+                    ; Key released - dim the Scan Back button, and resume playing from where we are
+                    jsr ToggleUIScanBackButton
                     jsr C22AudioPause
 ExitScanBackAction: rts
 
@@ -685,7 +702,7 @@ DoScanFwdAction:    lda PlayButtonState
                     bne ExitScanFwdAction
 
                     ; Highlight the Scan Forward button and engage "scan" mode forward
-                    jsr BLiTScanFwdButton
+                    jsr ToggleUIScanFwdButton
                     jsr C25AudioScanFwd
 
                     ; Keep updating the time display as long as you get good QSub reads
@@ -698,12 +715,12 @@ DSFALoop:           jsr C28ReadQSubcode
 DSFAQSubReadErr:    lda KbdStrobe
                     bmi DSFALoop
 
-                    ; Dim the Scan Forward button, and resume playing where we are
-                    jsr BLiTScanFwdButton
+                    ; Key released - dim the Scan Forward button, and resume playing from where we are
+                    jsr ToggleUIScanFwdButton
                     jsr C22AudioPause
 ExitScanFwdAction:  rts
 
-DoPrevTrackAction:  jsr BLiTPrevTrackButton
+DoPrevTrackAction:  jsr ToggleUIPrevButton
 
                     ; Reset to start of track
                     lda #$00
@@ -715,11 +732,13 @@ DPTAWrapCheck:      lda BCDRelTrack
                     cmp BCDFirstTrackTOC
                     ; If we're not at the "first" track, just decrement track #
                     bne DPTAJustPrev
+
                     ; Otherwise, wrap to the "last" track instead
                     lda BCDLastTrackTOC
                     sta BCDRelTrack
                     bra DPTACheckRandom
 
+                    ; BCD decrement
 DPTAJustPrev:       sed
                     lda BCDRelTrack
                     sbc #$01
@@ -737,13 +756,15 @@ DPTACheckRandom:    lda RandomButtonState
                     sta BCDRandomPickedTrk
                     jsr SetStopToEoBCDLTN
 
-                    ; This check does ABSOLUTELY NOTHING - pointless code, remove these two lines
+                    ; TODO: Remove - This check/branch does ABSOLUTELY NOTHING. Pointless code, remove these two lines
                     lda PlayButtonState
                     beq DPTARandomInactive
 
+                    ; Seek to new Track and update Track display
 DPTARandomInactive: jsr C20AudioSearch
                     jsr DrawTrack
 
+                    ; Wait a comparatively long time for key release
                     ldx #$ff
 DPTAHeldKeyCheck:   lda KbdStrobe
                     bpl DPTAKeyReleased
@@ -751,15 +772,15 @@ DPTAHeldKeyCheck:   lda KbdStrobe
                     bne DPTAHeldKeyCheck
 
 DPTAKeyWasHeld:     lda Kbd
-                    ; If key is held long enough, loop back to DPTAWrapCheck and go back another track
+                    ; If key is held long enough, loop all the way back to DPTAWrapCheck and go back another track
                     bpl DPTAWrapCheck
                     bit KbdStrobe
                     bra DPTAKeyWasHeld
 
-DPTAKeyReleased:    jsr BLiTPrevTrackButton
+DPTAKeyReleased:    jsr ToggleUIPrevButton
                     rts
 
-DoNextTrackAction:  jsr BLiTNextTrackButton
+DoNextTrackAction:  jsr ToggleUINextButton
 
                     ; Reset to start of track
                     lda #$00
@@ -771,11 +792,13 @@ DNTAWrapCheck:      lda BCDRelTrack
                     cmp BCDLastTrackTOC
                     ; If we're not at the "last" track, just increment track #
                     bne DNTAJustNext
+
                     ; Otherwise, wrap to the "first" track instead
                     lda BCDFirstTrackTOC
                     sta BCDRelTrack
                     bra DNTACheckRandom
 
+                    ; BCD increment
 DNTAJustNext:       sed
                     lda BCDRelTrack
                     adc #$01
@@ -786,20 +809,22 @@ DNTACheckRandom:    lda RandomButtonState
                     ; Random button is inactive - just execute playback
                     beq DNTARandomInactive
 
-                    ; Random is active - set the current Track as First/Last/Picked, and set the proper random Stop mode
+                    ; Random button is active - set the current Track as First/Last/Picked, and set the proper random Stop mode
                     lda BCDRelTrack
                     sta BCDFirstTrackNow
                     sta BCDLastTrackNow
                     sta BCDRandomPickedTrk
                     jsr SetStopToEoBCDLTN
 
-                    ; This check does ABSOLUTELY NOTHING - pointless code, remove these two lines
+                    ; TODO: Remove - This check/branch does ABSOLUTELY NOTHING. Pointless code, remove these two lines
                     lda PlayButtonState
                     beq DNTARandomInactive
 
+                    ; Seek to new Track and update Track display
 DNTARandomInactive: jsr C20AudioSearch
                     jsr DrawTrack
 
+                    ; Wait a comparatively long time for key release
                     ldx #$ff
 DNTAHeldKeyCheck:   lda KbdStrobe
                     bpl DNTAKeyReleased
@@ -807,15 +832,15 @@ DNTAHeldKeyCheck:   lda KbdStrobe
                     bne DNTAHeldKeyCheck
 
 DNTAKeyWasHeld:     lda Kbd
-                    ; If key is held long enough, loop back to DPTAWrapCheck and go back another track
+                    ; If key is held long enough, loop all the way back to DPTAWrapCheck and go forward another track
                     bpl DNTAWrapCheck
                     bit KbdStrobe
                     bra DNTAKeyWasHeld
 
-DNTAKeyReleased:    jsr BLiTNextTrackButton
+DNTAKeyReleased:    jsr ToggleUINextButton
                     rts
 
-C26Eject:           jsr BLiTEjectButton
+C26Eject:           jsr ToggleUIEjectButton
 
                     ; $26 = Eject
                     lda #$26
@@ -826,10 +851,10 @@ C26Eject:           jsr BLiTEjectButton
                     jsr SPCallVector
 
                     jsr KeyReleaseWait
-                    jsr BLiTEjectButton
+                    jsr ToggleUIEjectButton
 
                     lda StopButtonState
-                    ; Stop button is active - Just go wipe the Track & Time display and clear the TOC
+                    ; Stop button is active - just go wipe the Track & Time display and clear the TOC
                     bne ClearTrackTime_TOC
 
                     lda PauseButtonState
@@ -839,7 +864,7 @@ C26Eject:           jsr BLiTEjectButton
                     ; Clear Pause button to inactive
                     lda #$00
                     sta PauseButtonState
-                    jsr BLiTPauseButton
+                    jsr ToggleUIPauseButton
 
 EjPauseIsInactive:  lda PlayButtonState
                     ; Play button is inactive (already) - nothing to do
@@ -848,7 +873,7 @@ EjPauseIsInactive:  lda PlayButtonState
                     ; Clear Play button to inactive
                     lda #$00
                     sta PlayButtonState
-                    jsr BLiTPlayButton
+                    jsr ToggleUIPlayButton
 
                     ; Clear Drive Playing state
 EjPlayIsInactive:   lda #$00
@@ -857,9 +882,9 @@ EjPlayIsInactive:   lda #$00
                     ; Set Stop button to active
                     dec a
                     sta StopButtonState
-                    jsr BLiTStopButton
+                    jsr ToggleUIStopButton
 
-                    ; Null out T/M/S, blank Track & Time display, and invalidate the TOC
+                    ; "Null" out T/M/S, blank Track & Time display, and invalidate the TOC
 ClearTrackTime_TOC: lda #$aa
                     sta BCDRelTrack
                     sta BCDRelMinutes
@@ -897,10 +922,10 @@ C21AudioPlay:       lda #$ff
                     sta SPBuffer + 1
 
                     lda TrackOrMSFFlag
-                    ; Use M/S/F for the sequential mode to stop at the end of the disc
+                    ; Use M/S/F to stop playback at the end of the disc for sequential mode
                     beq APStopAtMSF
 
-                    ; Use end of currently-picked Track as "stop" point for random mode
+                    ; Use end of currently-selected Track as "stop" point for random mode
 APStopAtTrack:      lda BCDFirstTrackNow
                     sta SPBuffer + 2
                     ; Address Type = $02 (Track)
@@ -957,7 +982,7 @@ ASExecuteSearch:    sta SPBuffer
                     sta SPBuffer + 6
                     jsr SPCallVector
 
-                    ; **** This whole block of code is dead/unbranched - remove all of it up through ExitDeadCode ****
+                    ; TODO: Remove - This whole block of code is dead/unbranched - remove all of it up through DeadCodeExit
                     bra ASSkipDeadCode
 DeadCode:           phx
                     ldx #$03
@@ -971,12 +996,12 @@ DeadCodeLoop:       jsr C24AudioStatus
 DeadCodeExit:       plx
 
 ASSkipDeadCode:     lda PauseButtonState
-                    ; Pause button is inactive
+                    ; Pause button is inactive (already) - nothing to do
                     beq ASPauseIsInactive
 
                     ; Clear Pause button to inactive
                     inc PauseButtonState
-                    jsr BLiTPauseButton
+                    jsr ToggleUIPauseButton
 
 ASPauseIsInactive:  lda BCDRelTrack
                     sta BCDFirstTrackNow
@@ -1005,9 +1030,9 @@ C27ReadTOC:         lda #$04
                     ; $27 = ReadTOC
                     lda #$27
                     sta SPCode
-                    ; Start Track # = $00 (First Track), Type = $00 (First/Last Track numbers)
+                    ; Start Track # = $00 (Whole Disc), Type = $00 (request First/Last Track numbers)
                     jsr ZeroOutSPBuffer
-                    ; Allocation Length = $0A
+                    ; Allocation Length = $0A (even though this space is unused)
                     lda #$0a
                     sta SPBuffer + 1
 
@@ -1048,7 +1073,7 @@ RetryReadQSubcode:  jsr SPCallVector
                     bne RetryReadQSubcode
                     bra ExitReadQSubcode
 
-                    ; TODO: What do these return values actually represent?  Are the variable names appropriate?
+                    ; TODO: Analysis - What do these returned values actually represent?  Are the variable names being used here appropriate?
 ReadQSubcodeSuccess:lda SPBuffer + 1
                     sta BCDRelTrack
                     lda SPBuffer + 3
@@ -1062,12 +1087,14 @@ ReadQSubcodeSuccess:lda SPBuffer + 1
                     lda SPBuffer + 8
                     sta BCDAbsFrame
                     lda SPBuffer + 2
-                    ; TODO: Is this index?  Does Index 0 (gap/transition) get treated as a read error?
+                    ; TODO: Analysis - Is this value perhaps the Track Index?  Does Index 0 (gap/transition) get treated as a QSub read error?
                     beq ReadQSubcodeFail
 
+                    ; Clear carry on success
                     clc
                     bra ExitReadQSubcode
 
+                    ; Set carry on failure
 ReadQSubcodeFail:   sec
 ExitReadQSubcode:   rts
 
@@ -1082,7 +1109,7 @@ C23AudioStop:       lda #$00
                     sta SPCode
                     ; Address type = $00 (Block), Block = 0
                     jsr ZeroOutSPBuffer
-                    ; TODO: What does this all-zero AudioStop call actually do?  Clear all existing stops?  Explicitly stop now?  Something else?
+                    ; TODO: Analysis - What does an all-zeroes AudioStop call actually do?  Just clear any existing set stop point?  Explicitly stop playback now?  Something else?
                     jsr SPCallVector
 
                     ; $04 = Control
@@ -1098,6 +1125,7 @@ SetStopToEoBCDLTN:  lda #$04
                     ; Address Type = $02 (Track)
                     lda #$02
                     sta SPBuffer + 4
+                    ; Set a stop point at EoT, last Track
                     jsr SPCallVector
                     rts
 
@@ -1109,13 +1137,12 @@ C22AudioPause:      lda #$04
                     sta SPCode
                     jsr ZeroOutSPBuffer
 
-                    ; $00 = Pause button is "Inactive" and dim in UI, $FF = Pause button is "Active" and highlighted in UI
                     lda PauseButtonState
-                    ; Invert the Pause button state...
+                    ; Invert the current Pause button state...
                     eor #$ff
                     ; and make it the Drive Playing state
                     sta DrivePlayingFlag
-                    ; Mask off the low bit to use the Drive Playing state to control the Pause/Unpause parameter
+                    ; Mask off the low bit in order to use the new Drive Playing state value to set the Pause/Unpause parameter for the call
                     and #$01
                     ; $00 = Pause, $01 = UnPause/Resume (Button $00 = Paused, $FF = Unpaused)
                     sta SPBuffer
@@ -1177,6 +1204,7 @@ SPZeroLoop:         sta SPBuffer,x
                     bpl SPZeroLoop
                     rts
 
+                    ; Save state
 ClearHGR1toWhite:   pha
                     phx
                     phy
@@ -1184,16 +1212,20 @@ ClearHGR1toWhite:   pha
                     pha
                     lda ZP1 + 1
                     pha
-                    ; (ZP1) = $2000, X = $20 pages
+
+                    ; (ZP1) = Memory address $2000/HGR1
                     lda #$00
                     sta ZP1
                     lda #$20
                     sta ZP1 + 1
+                    ; X = $20 pages
                     ldx #$20
 
+                    ; $20 (32) pages of 256 bytes = 8K
 Loop8K:             ldy #$00
-                    lda #$ff
 
+                    lda #$ff
+                    ; 256 bytes of $FF (white)
 Loop256:            sta (ZP1),y
                     iny
                     bne Loop256
@@ -1205,6 +1237,7 @@ Loop256:            sta (ZP1),y
                     dex
                     bne Loop8K
 
+                    ; Restore state and exit
                     pla
                     sta ZP1 + 1
                     pla
@@ -1215,10 +1248,10 @@ Loop256:            sta (ZP1),y
                     rts
 
 FindHardware:       jsr FindSCSICard
-                    bcs ExitSetup
+                    bcs ExitFindHardware
                     jsr SmartPortCallSetup
                     jsr FindCDROM
-ExitSetup:          rts
+ExitFindHardware:   rts
 
 FindSCSICard:       lda #$07
 CheckSlot:          sta CardSlot
@@ -1235,10 +1268,12 @@ CheckSlot:          sta CardSlot
                     dec a
                     bne CheckSlot
                     jsr NoSCSICardError
+                    ; Set carry on error
                     sec
-                    bra FindSCSICardDone
+                    bra ExitFindSCSICard
+                    ; Clear carry on success
 YesFound:           clc
-FindSCSICardDone:   rts
+ExitFindSCSICard:   rts
 
 NoSCSICardError:    lda ZP1
                     pha
@@ -1249,15 +1284,18 @@ NoSCSICardError:    lda ZP1
                     lda NoSCSIMsgAddr + 1
                     sta ZP1 + 1
                     ldy #$00
-PrintLoop1:         lda (ZP1),y
-                    beq KeyPressLoop1
+NSCEPrintLoop:      lda (ZP1),y
+                    beq NSCEKeyPressLoop
                     iny
                     ora #$80
-                    jsr $fded
-                    bra PrintLoop1
-                    .byte   $8d, $10, $c0
-KeyPressLoop1:      lda KbdStrobe
-                    bpl KeyPressLoop1
+                    jsr COUT
+                    bra NSCEPrintLoop
+
+                    ; TODO: Remove - This STA is bypassed, and can be removed.
+                    sta KbdStrobe
+
+NSCEKeyPressLoop:   lda KbdStrobe
+                    bpl NSCEKeyPressLoop
                     pla
                     sta ZP1 + 1
                     pla
@@ -1306,7 +1344,7 @@ NextDevice:         stx CD_SPDevNum
                     lda SPBuffer
                     ; Force "online" bit true
                     ora #$10
-                    ; $B4 = 10110100 = Block device, Not writeable, Readable, Can't format, Write protected
+                    ; $B4 = 10110100 = Block device, Not writeable, Readable, Can't format, Write protected (aka CD-ROM)
                     cmp #$b4
                     beq CDROMFound
 
@@ -1314,10 +1352,12 @@ NextDevice:         stx CD_SPDevNum
                     dex
                     bne NextDevice
                     jsr NoCDROMError
+                    ; Set carry on failure
                     sec
-                    bra FindCDROMDone
+                    bra ExitFindCDROM
+                    ; Clear carry on success
 CDROMFound:         clc
-FindCDROMDone:      rts
+ExitFindCDROM:      rts
 
 NoCDROMError:       lda ZP1
                     pha
@@ -1328,15 +1368,18 @@ NoCDROMError:       lda ZP1
                     lda NoCDROMMsgAddr + 1
                     sta ZP1 + 1
                     ldy #$00
-PrintLoop2:         lda (ZP1),y
-                    beq KeyPressLoop2
+NCDEPrintLoop:      lda (ZP1),y
+                    beq NCDEKeyPressLoop
                     iny
                     ora #$80
-                    jsr $fded
-                    bra PrintLoop2
-                    .byte   $8d, $10, $c0
-KeyPressLoop2:      lda KbdStrobe
-                    bpl KeyPressLoop2
+                    jsr COUT
+                    bra NCDEPrintLoop
+
+                    ; TODO: Remove - This STA is bypassed, and can be removed.
+                    sta KbdStrobe
+
+NCDEKeyPressLoop:   lda KbdStrobe
+                    bpl NCDEKeyPressLoop
                     pla
                     sta ZP1 + 1
                     pla
@@ -1368,10 +1411,9 @@ SelfModLDA:         lda CardROMByte
                     rts
 
 MLIQUIT:            jsr MLIEntry
-
                     ; $65 = QUIT
-                    .byte   $65
-                    .addr   QuitParms
+MLICOMMAND:         .byte   $65
+MLIPARMTABLE:       .addr   QuitParms
 
                     brk
 
@@ -1392,9 +1434,9 @@ SPParmsAddr:        .addr   SPParmCount
 SPParmCount:        .byte   $00
 SPUnitNumber:       .byte   $00
 SPBufferAddr:       .addr   SPBuffer
-                    ; Status code for Status ($00) SPCommandType, Control code for Control ($04) SPCommandType
+                    ; Status code for SPCommandType Status ($00), Control code for SPCommandType Control ($04)
 SPCode:             .byte   $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
-                    ; Command-specific data buffer
+                    ; SP Command-specific data buffer
 SPBuffer:           .byte   $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
                     .byte   $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
                     .byte   $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
@@ -2003,9 +2045,10 @@ ScanFwdButtonAddr:  .addr   ScanFwdButtonMask
 LoopButtonAddr:     .addr   LoopButtonMask
 RandomButtonAddr:   .addr   RandomButtonMask
 
-BLiTVar1:           .byte   $00
-BLiTVar2:           .byte   $00
-BLiTVar3:           .byte   $00
+                    ; Variables used during various UI paint and highlight/unhighlight operations
+UIOperationVar1:    .byte   $00
+UIOperationVar2:    .byte   $00
+UIOperationVar3:    .byte   $00
 
 PaintCDRemoteUI:    pha
                     phx
@@ -2023,13 +2066,13 @@ PaintCDRemoteUI:    pha
                     lda HGRBaseTableAddr + 1
                     sta ZP2 + 1
 
-                    ; Starting HGR base address
+                    ; Starting offset into HGR base address table
                     ldy #$00
-                    ; Batches of 8 lines to BLiT_(24 x 8 = 192)
+                    ; Number of sets of 8 lines to iterate (24 x 8 = 192)
                     ldx #$18
-                    ; Starting offset into HGR lines
+                    ; Width of paint area
                     lda #$17
-                    sta BLiTVar1
+                    sta UIOperationVar1
 
                     ; (ZP3) = HGR Base Address n
 PaintUILoop:        lda (ZP2),y
@@ -2148,10 +2191,10 @@ PaintCDRemoteMenu:  pha
 
                     ; Width of Block
                     lda #$14
-                    sta BLiTVar2
+                    sta UIOperationVar2
                     ; Starting HGR base address
                     ldy #$06
-                    ; Batches of 8 lines to BLiT_(13 x 8 = 104)
+                    ; Number of sets of 8 lines to iterate (13 x 8 = 104)
                     ldx #$0d
 
                     ; (ZP3) = HGR Base Address n
@@ -2162,7 +2205,7 @@ PaintMenuLoop:      lda (ZP2),y
                     sta ZP3
                     iny
 
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
 
                     dex
                     bne PaintMenuLoop
@@ -2291,23 +2334,25 @@ PaintUISub:         pha
                     phx
                     phy
 
+                    ; Calculate offset so UI graphic is right-justified
                     clc
                     lda #$29
-                    sbc BLiTVar1
-                    sta BLiTVar2
+                    sbc UIOperationVar1
+                    sta UIOperationVar2
+
                     lda #$08
 
 RawPaintOuterLoop:  pha
                     lda #$00
-                    sta BLiTVar3
-                    ldx BLiTVar1
-                    lda BLiTVar2
+                    sta UIOperationVar3
+                    ldx UIOperationVar1
+                    lda UIOperationVar2
 
 RawPaintInnerLoop:  pha
-                    ldy BLiTVar3
+                    ldy UIOperationVar3
                     lda (ZP1),y
                     iny
-                    sty BLiTVar3
+                    sty UIOperationVar3
                     pha
                     txa
                     tay
@@ -2324,7 +2369,7 @@ RawPaintInnerLoop:  pha
                     sta ZP3 + 1
                     clc
                     lda ZP1
-                    adc BLiTVar2
+                    adc UIOperationVar2
                     sta ZP1
                     lda ZP1 + 1
                     adc #$00
@@ -2338,154 +2383,155 @@ RawPaintInnerLoop:  pha
                     pla
                     rts
 
-BLiTStopButton:     pha
+ToggleUIStopButton: pha
                     lda StopButtonAddr
                     sta ZP1
                     lda StopButtonAddr + 1
                     sta ZP1 + 1
-                    bra DoBLiTRow1
-BLiTPlayButton:     pha
+                    bra ToggleUIButtonRow1
+ToggleUIPlayButton: pha
                     lda PlayButtonAddr
                     sta ZP1
                     lda PlayButtonAddr + 1
                     sta ZP1 + 1
-DoBLiTRow1:         lda #$28
-                    sta BLiTVar2
+ToggleUIButtonRow1: lda #$28
+                    sta UIOperationVar2
                     lda #$22
                     sta ZP3 + 1
                     lda #$00
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     lda #$22
                     sta ZP3 + 1
                     lda #$80
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     pla
                     rts
 
-BLiTEjectButton:    pha
+ToggleUIEjectButton:pha
                     lda EjectButtonAddr
                     sta ZP1
                     lda EjectButtonAddr + 1
                     sta ZP1 + 1
-                    bra DoBLiTRow2
-BLiTPauseButton:    pha
+                    bra ToggleUIButtonRow2
+ToggleUIPauseButton:pha
                     lda PauseButtonAddr
                     sta ZP1
                     lda PauseButtonAddr + 1
                     sta ZP1 + 1
-DoBLiTRow2:         lda #$28
-                    sta BLiTVar2
+ToggleUIButtonRow2: lda #$28
+                    sta UIOperationVar2
                     lda #$23
                     sta ZP3 + 1
                     lda #$80
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     lda #$20
                     sta ZP3 + 1
                     lda #$28
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     pla
                     rts
 
-BLiTNextTrackButton:pha
+ToggleUINextButton: pha
                     lda NextTrackButtonAddr
                     sta ZP1
                     lda NextTrackButtonAddr + 1
                     sta ZP1 + 1
-                    bra DoBLiTRow3
-BLiTPrevTrackButton:pha
+                    bra ToggleUIButtonRow3
+ToggleUIPrevButton: pha
                     lda PrevTrackButtonAddr
                     sta ZP1
                     lda PrevTrackButtonAddr + 1
                     sta ZP1 + 1
-DoBLiTRow3:         lda #$28
-                    sta BLiTVar2
+ToggleUIButtonRow3: lda #$28
+                    sta UIOperationVar2
                     lda #$23
                     sta ZP3 + 1
                     lda #$28
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     lda #$23
                     sta ZP3 + 1
                     lda #$a8
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     pla
                     rts
 
-BLiTScanBackButton: pha
+ToggleUIScanBackButton: pha
                     lda ScanBackButtonAddr
                     sta ZP1
                     lda ScanBackButtonAddr + 1
                     sta ZP1 + 1
-                    bra DoBLiTRow4
-BLiTScanFwdButton:  pha
+                    bra ToggleUIButtonRow4
+ToggleUIScanFwdButton:  pha
                     lda ScanFwdButtonAddr
                     sta ZP1
                     lda ScanFwdButtonAddr + 1
                     sta ZP1 + 1
-DoBLiTRow4:         lda #$28
-                    sta BLiTVar2
+ToggleUIButtonRow4: lda #$28
+                    sta UIOperationVar2
                     lda #$20
                     sta ZP3 + 1
                     lda #$50
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     lda #$20
                     sta ZP3 + 1
                     lda #$d0
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     lda #$21
                     sta ZP3 + 1
                     lda #$50
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     pla
                     rts
 
-BLiTLoopButton:     pha
+ToggleUILoopButton: pha
                     lda LoopButtonAddr
                     sta ZP1
                     lda LoopButtonAddr + 1
                     sta ZP1 + 1
-                    bra DoBLiTRow5
-BLiTRandomButton:   pha
+                    bra ToggleUIButtonRow5
+ToggleUIRandButton: pha
                     lda RandomButtonAddr
                     sta ZP1
                     lda RandomButtonAddr + 1
                     sta ZP1 + 1
-DoBLiTRow5:         lda #$28
-                    sta BLiTVar2
+ToggleUIButtonRow5: lda #$28
+                    sta UIOperationVar2
                     lda #$21
                     sta ZP3 + 1
                     lda #$d0
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     lda #$22
                     sta ZP3 + 1
                     lda #$50
                     sta ZP3
-                    jsr MaskPaintSub
+                    jsr MaskInvertSub
                     pla
                     rts
 
-MaskPaintSub:       pha
+                    ; Invert a set of 8 lines, using the Mask at (ZP1)
+MaskInvertSub:      pha
                     phx
                     phy
                     ldx #$08
 
-MaskPaintOuterLoop: ldy #$00
+MaskInvertOuterLoop:ldy #$00
 
-MaskPaintInnerLoop: lda (ZP1),y
+MaskInvertInnerLoop:lda (ZP1),y
                     eor (ZP3),y
                     sta (ZP3),y
                     iny
-                    cpy BLiTVar2
-                    bne MaskPaintInnerLoop
+                    cpy UIOperationVar2
+                    bne MaskInvertInnerLoop
 
                     clc
                     lda ZP3 + 1
@@ -2493,26 +2539,26 @@ MaskPaintInnerLoop: lda (ZP1),y
                     sta ZP3 + 1
                     clc
                     lda ZP1
-                    adc BLiTVar2
+                    adc UIOperationVar2
                     sta ZP1
                     lda ZP1 + 1
                     adc #$00
                     sta ZP1 + 1
                     dex
-                    bne MaskPaintOuterLoop
+                    bne MaskInvertOuterLoop
 
                     ply
                     plx
                     pla
                     rts
 
-                    ; TODO: Understand the operation of this subroutine better, improve comments
+                    ; TODO: Analysis - Understand the operation of this subroutine better, improve comments
 PickARandomTrack:   pha
                     ; Pick a random, unplayed track
                     phx
                     phy
 
-                    ; Try five times to find a PL element that is $00
+                    ; Try five times to find a Played List element that is $00
                     ldx #$05
 FindRandomUnplayed: jsr TrackPseudoRNGSub
                     tay
@@ -2543,7 +2589,7 @@ OffsetNotZero:      cpy HexTrackCount0Base
 TryThisTrack:       lda (PlayedListPtr),y
                     bne FallbackTrackSelect
 
-                    ; Mark the PL element with $FF and set PLVar1 to the BCD Track number
+                    ; Mark the PlayedList element for the selected Track to $FF ("played") and set BCDRandomPickedTrk to the BCD Track number
 FoundUnplayedTrack: lda #$ff
                     sta (PlayedListPtr),y
                     tya
@@ -2557,7 +2603,7 @@ FoundUnplayedTrack: lda #$ff
 
 PlayedListDirection:.byte   $00
 
-                    ; TODO: Understand the operation of this subroutine better, improve comments
+                    ; TODO: Analysis - Understand the operation of this subroutine better, improve comments
 TrackPseudoRNGSub:  phx
                     ; Return A as (Seed * 253) mod HexMaxTrackOffset
                     phy
@@ -2568,7 +2614,7 @@ TrackPseudoRNGSub:  phx
                     bne PRNGSeedIsValid
                     inc a
 
-                    ; A = PLVar4 = Seed (adjusted to 1-255)
+                    ; A = RandFuncTempStorage = Seed (adjusted to 1-255)
 PRNGSeedIsValid:    sta RandFuncTempStorage
                     dex
 
@@ -2596,7 +2642,7 @@ ExitMathLoop2:      inc a
                     plx
                     rts
 
-                    ; This just zeroes all 99 elements in the "playedlist"
+                    ; This just zeroes all 99 elements in the Played List
 ClearPlayedList:    lda #$00
                     ldy #$63
 
@@ -2606,26 +2652,26 @@ CPLLoop:            sta (PlayedListPtr),y
 
                     rts
 
-                    ; Set up the ($1F) PlayedList pointer, zero all the "played list" elements, init the "played track" counter and Direction variable
-CPLInitPlayedList:  lda PlayedListAddr
+                    ; Set up the ($1F) Played List ZP pointer and zero all the Played List elements
+InitPlayedList:     lda PlayedListAddr
                     sta PlayedListPtr
                     lda PlayedListAddr + 1
                     sta PlayedListPtr + 1
 
                     jsr ClearPlayedList
 
-                    ; Zero the "played track count"
+                    ; Zero the Played Track Counter
                     lda #$00
                     sta HexPlayedCount0Base
 
-                    ; PLDirection initially is +1
+                    ; Set the PLDirection initially to +1
                     lda #$01
                     sta PlayedListDirection
                     rts
 
-                    ; TODO: WTF?? This *seems* like an attempt to convert from BCD to binary, but it's... not.  It's kinda wonky.
+                    ; TODO: Analysis - WTF is going on here?? This *seems* like an attempt to convert from BCD to binary, but it's... not.  It's kinda wonky.
 Hex2BCDSorta:       phx
-                    ; TODO: The return values from this function seem bizarre and inexplicable.  Better analysis needs to be done on this code.
+                    ; TODO: Analysis - The return values from this function seem bizarre and inexplicable.  Better analysis needs to be done on this code.
                     phy
 
                     ldx #$00
@@ -2713,6 +2759,3 @@ PlayedList:         .byte   $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
                     .byte   $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
                     .byte   $00, $00, $00, $00, $00, $00, $00, $00, $00, $00
 PlayedListAddr:     .addr   PlayedList
-
-
-
